@@ -1,0 +1,271 @@
+/////////////////////////////////////////////////////////////
+// Jenkins pipeline for STERLING Agents and Integrations 
+// Label Maintainer: Saravanan V        
+/////////////////////////////////////////////////////////////
+def agnt_servers
+def node_ips = [
+    node_01: "hostnmae",
+    node_02: "hostname",
+    // node_0n: "hostname"
+]
+pipeline {
+    agent {
+        label '<Agent Label Name>'
+    }
+    options {
+        disableConcurrentBuilds()
+    }
+    parameters {
+        booleanParam(name: 'GIT_UPDATE_FLAG', defaultValue: true, description: 'Fetch server scripts from Git repository')
+        booleanParam(name: 'NODE_01', defaultValue:true, description: "Start and stop processes on Node 01 - ${node_ips.node_01}")
+        booleanParam(name: 'NODE_02', defaultValue:true, description: "Start and stop processes on Node 02 - ${node_ips.node_02}")
+        // booleanParam(name: 'NODE_n', defaultValue:true, description: "Start and stop processes on Node 01 - ${node_ips.NODE_n}")
+        booleanParam(name: 'STOP_ALL', defaultValue: false, description: 'Stop all Agent and Integration servers?')
+        booleanParam(name: 'SETUP_AGENT_BOX', defaultValue: false, description: 'Setup files in Agent box?')
+        booleanParam(name: 'START_ALL', defaultValue: false, description: 'Start all Agent and Integration servers?')
+    }
+    environment {
+        // Replace the values as per the environment
+        agnt_scripts_dir = "/opt/IBM/scripts"                       // Specify the STERLING agent scripts directory 
+        gitRepoBranch = "DEV_AGNTS"                                 // Specify the STERLING agent scripts git repo branch name
+        ssh_user = "omsadmin"                                       // Specify the SSH username of Agent Nodes
+        sterling_dir = "/opt/IBM/OMS10"                             // Specify the STERLING Foundation directory
+        healthMonitornode = "hostname"                            // Specify the IP of HealthMonitor node
+        db_client_node = "hostname"                               // Specify the IP of DB Client connection Node
+        db_client_user = "omsadmin"                                 // Specify the SSH username of DB Client connection Node
+        dbscripts_dir = "/home/omsadmin/scripts/clear-heartbeat"    // Specify the DB stale scripts directory on DB Client connection Node
+        // FOR Pipeline Logic 
+        stopPipeline = "false"
+        STOP_PIPELINE = "false"
+    }
+    stages {
+        stage('Build Detail') {
+            steps { 
+                script {
+                    agnt_servers = [] //List of Agent Server nodes
+                    if (params.NODE_01) {
+                        agnt_servers.add("${node_ips.node_01}")
+                    }
+                    if (params.NODE_02) {
+                        agnt_servers.add("${node_ips.node_02}")
+                    }
+                    def outputMessage = """
+Git Fetch Files            : ${params.GIT_UPDATE_FLAG}
+Selected Nodes         : ${agnt_servers.join(', ')}
+Stopping Process      : ${params.STOP_ALL}
+Setup Agent Nodes   : ${params.SETUP_AGENT_BOX}
+Starting Process        : ${params.START_ALL}
+                    """
+                    echo outputMessage
+                }
+            }
+        }
+        stage('Git Checkout') {
+            when {
+                expression {params.GIT_UPDATE_FLAG == true}
+            }
+            steps {
+                script {
+                    try {
+                        // Execute the GIT Checkout in custom workspace
+                        // Checkout Git repository into the subdirectory with credentials
+                        def GIT_REPO_URL = 'Git Repo Link'
+                        def GIT_CREDENTIALS_ID = 'Git Repo Jenkins Access Cred ID'
+                        checkout([$class: 'GitSCM',
+                                branches: [[name: gitRepoBranch]], doGenerateSubmoduleConfigurations: false,
+                                extensions: [[$class: 'CloneOption', noTags: true, reference: '', shallow: true, depth: 1,
+                                                sparseCheckoutPaths: [[path: 'Scripts']]]],
+                                userRemoteConfigs: [[url: GIT_REPO_URL, credentialsId: GIT_CREDENTIALS_ID]]
+                        ])
+            
+                    } catch (Exception e) {
+                        error("Failed to checkout from Git: ${e.message}")
+                    }
+                }
+            }
+        }
+        stage('Copy Scripts to Agent Box'){
+            when {
+                expression {params.GIT_UPDATE_FLAG == true}
+            }
+            steps {
+                script{
+                    try {
+                        echo "Copying DB Clear Script to DB Client Node"
+                        sh """scp -r ${WORKSPACE}/Scripts/DB-Scripts/*.sh ${ssh_user}@${db_client_node}:${dbscripts_dir}/"""
+                        def parallelBranches = [:]
+                        agnt_servers.each { node ->
+                            parallelBranches[node] = {
+                                echo "Copying scripts to ${node}"
+                                sh """
+                                    scp -r ${WORKSPACE}/Scripts/${node}.sh ${ssh_user}@${node}:${agnt_scripts_dir}
+                                    scp -r ${WORKSPACE}/Scripts/*orgname_V2.sh ${ssh_user}@${node}:${agnt_scripts_dir}
+                                """
+                                // Insert Source command to the startServers_orgname_V2.sh
+                                sh """
+                                    ssh ${ssh_user}@${node} "sed -i '4s,.*,source ${agnt_scripts_dir}/${node}.sh,' /${agnt_scripts_dir}/startServers_orgname_V2.sh"
+                                """
+                            }
+                        }
+                        parallel parallelBranches
+                    } catch (Exception e) {
+                        error("Failed to copy scripts to Agent boxes: ${e.message}")
+                    }
+                }
+            }
+        }
+        stage('Stop All Servers') {
+            when {
+                expression {params.STOP_ALL == true}
+            }
+            steps {
+                script {
+                    try {
+                        def parallelBranches = [:]
+                        agnt_servers.each { node ->
+                            parallelBranches[node] = {
+                                sh """
+                                    ssh ${ssh_user}@${node} "sh ${agnt_scripts_dir}/stopServers_orgname_V2.sh ALL"
+                                """
+                            }
+                        }
+                        parallel parallelBranches
+                        sleep time: 10, unit: 'SECONDS'
+                        if (params.NODE_01 && params.NODE_02) {
+                            // Clear the DB Stale 01 and 02 Entries 
+                            sh """
+                                ssh ${db_client_user}@${db_client_node} "sh ${env.dbscripts_dir}/clear-db-stales-AGNT.sh ALL"
+                            """
+                        } else {
+                            if (params.NODE_01) {
+                                sh """
+                                    ssh ${db_client_user}@${db_client_node} "sh ${env.dbscripts_dir}/clear-db-stales-AGNT.sh HOST OMS10DEVAGNMC01"
+                                """
+                            }
+
+                            if (params.NODE_02) {
+                                sh """
+                                    ssh ${db_client_user}@${db_client_node} "sh ${env.dbscripts_dir}/clear-db-stales-AGNT.sh HOST oms10devagnmc02"
+                                """
+                            }
+                        }
+                    } catch (Exception e) {
+                        error("Failed to Stop Agents and Clear DB Stales: ${e.message}")
+                    }
+                }
+            }
+        }
+        stage('Setup Agents Nodes') {
+            when {
+                expression {params.SETUP_AGENT_BOX == true}
+            }
+            steps {
+                script {
+                    try {
+                        def parallelBranches = [:]
+                        agnt_servers.each { node ->
+                            parallelBranches[node] = {
+                                // // setupAgent.sh script must be present in the all agent nodes mentioned directory | OLD Shell Script
+                                // sh """
+                                // ssh ${ssh_user}@${node} "sh ${env.sterling_dir}/bin/setupAgent.sh"
+                                // """
+
+                                // setupRuntimeAGNT.sh script must be present in the all agent nodes mentioned directory
+                                sh """
+                                ssh ${ssh_user}@${node} "sh ${env.sterling_dir}/bin/setupRuntimeAGNT.sh"
+                                """
+                            }
+                        }
+                        parallel parallelBranches
+                    } catch (Exception e) {
+                        error("Failed to Setup Agents Box: ${e.message}")
+                    }
+                }
+            }
+        }
+        stage('Check Java Process') {
+            when {
+                expression {params.START_ALL == true}
+            }
+            steps {
+                script {
+                    stopPipeline = "false"
+                    // Check Java Process on Nodes
+                    for (node in agnt_servers) {
+                        try {
+                           def javaProcessCount = sh(script: "ssh ${ssh_user}@${node} 'sh /${agnt_scripts_dir}/checkJavaProcess_orgname_V2.sh'", returnStdout: true)
+                            def javaProcessCount1 = javaProcessCount.trim()
+                            if (javaProcessCount1 == 'ZERO') {
+                                echo "Java process count on node ${node} is zero."
+                            } else {
+                                echo "Java process count on node ${node} is not zero. Stopping the Pipeline"
+                                stopPipeline = "true"
+                                break
+                            }
+                        } catch (Exception e) {
+                            error("Failed to check Java processes on node ${node}: ${e.message}")
+                            stopPipeline = "true"
+                        }
+                    }
+                    if (stopPipeline == "false") {
+                        STOP_PIPELINE = "false"
+                    } else {
+                        STOP_PIPELINE = "true"
+                        error("Stopping the Pipeline due to Java process running on one of the nodes.")
+                    }
+                }
+            }
+        }
+        stage('Start ALL Servers') {
+            when {
+                expression { 
+                    def condition = params.START_ALL == true && STOP_PIPELINE == "false"
+                    echo "Condition: ${condition}"
+                    condition
+                }
+            }
+            steps {
+                script {
+                    try {
+                        def intg_parallelBranches = [:]
+                        agnt_servers.each { node ->
+                            intg_parallelBranches[node] = {
+                                catchError {
+                                    // Start Integration Servers
+                                    sh """
+                                        ssh ${ssh_user}@${node} "sh ${agnt_scripts_dir}/startServers_orgname_V2.sh Integrations"
+                                    """
+                                }
+                            }
+                        }
+                        def agnt_parallelBranches = [:]
+                        agnt_servers.each { node ->
+                            agnt_parallelBranches[node] = {
+                                catchError {
+                                    // Start Agent Servers
+                                    sh """
+                                        ssh ${ssh_user}@${node} "sh ${agnt_scripts_dir}/startServers_orgname_V2.sh Agents"
+                                    """
+                                }
+                            }
+                        }
+                        // Parallel Execution of Integration start command on Each Node
+                        parallel intg_parallelBranches
+                        // Execution of HealthMonitor command on HealthMonitor Node only
+                        if (agnt_servers.any { it.toString() == healthMonitornode }) {
+                            sh """
+                                ssh ${ssh_user}@${healthMonitornode} "sh ${agnt_scripts_dir}/startServers_orgname_V2.sh HealthMonitor"
+                            """
+                        } else {
+                            echo "Skipping HealthMonitor."
+                        }
+                        // Parallel Execution of Agents start command on Each Node
+                        parallel agnt_parallelBranches
+                    } catch (Exception e) {
+                        error("Failed to Start All Integration, HealthMonitor and Agent Servers: ${e.message}")
+                    }
+                }
+            }
+        }
+    }
+}

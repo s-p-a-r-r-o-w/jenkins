@@ -1,0 +1,144 @@
+//////////////////////////////////////////////////////////
+// Jenkins pipeline for HOT Deploy                
+// Label Maintainer: Saravanan V   
+//////////////////////////////////////////////////////////
+def app_node_ips = [
+    node_01: "hostname", 
+    // node_02: "IP-Address"
+]
+pipeline {
+    agent {
+        label '<Agent Label Name>'
+    }
+    options {
+        disableConcurrentBuilds()
+    }
+    environment {
+        // Replace the values as per the environment
+        sterling_dir = "/opt/IBM/OMS10"                             // Specify the STERLING Foundation directory
+        ssh_user = "omsadmin"                                       // Specify the SSH username of APP Nodes
+        entity_automation_dir = "/opt/jenkins/entity_automation"
+    }
+
+    stages {
+        stage('Hot Deploy') {
+            steps {
+                script {
+                    app_servers = []
+                    app_node_ips.each { key, value ->
+                        app_servers.add(value)
+                    }
+                    try {
+                        def app_servers_setup_parallelBranches = [:]
+                            app_servers.each { node ->
+                                app_servers_setup_parallelBranches[node] = {
+                                    catchError {
+                                        echo "Setting up runtime on appserver node: ${node}"
+                                        sh """
+                                            ssh ${ssh_user}@${node} "sh ${sterling_dir}/bin/setupRuntimeAPP.sh"
+                                        """
+                                    }
+                                }
+                            }
+                        parallel app_servers_setup_parallelBranches
+                    } catch (Exception e) {
+                        error("Failed to hot deploy changes in App Nodes: ${e.message}")
+                    }
+                }
+            }
+        }
+        stage('Handling Entity Changes'){
+            steps {
+                script {
+                    try {
+                        // Read the entity.flag file to determine if the script should be executed
+                        sh """
+                            scp ${ssh_user}@${app_node_ips.node_01}:${entity_automation_dir}/entity.flag  ${entity_automation_dir}/
+                        """
+                        def entityFlag = readFile("${entity_automation_dir}/entity.flag").trim()
+
+                        if (entityFlag == 'true') {
+                            echo "Entity flag is true. Proceeding with DB verification and entity handling."
+
+                            // Run the dbverify.sh script on the remote app node
+                            def result = sh(script: "ssh ${ssh_user}@${app_node_ips.node_01} 'sh ${sterling_dir}/bin/dbverify.sh'", returnStatus: true)
+                            echo "DB verify script success with exit code ${result}"
+                            if (result == 0) {
+                                echo "DB verify script executed successfully."
+
+                                // Run the entity handler Python script
+                                sh """
+                                    ssh ${ssh_user}@${app_node_ips.node_01} 'python3 ${entity_automation_dir}/entity_handler.py'
+                                    scp ${ssh_user}@${app_node_ips.node_01}:${entity_automation_dir}/entity_dbcr.sql  ${entity_automation_dir}/
+                                    scp ${ssh_user}@${app_node_ips.node_01}:${entity_automation_dir}/tables.diff  ${entity_automation_dir}/
+                                """
+                                // Read the content of the generated SQL file
+                                def sqlScript = readFile("${entity_automation_dir}/entity_dbcr.sql")
+                                echo "Below is the SQL script for the entity changes"
+                                echo "${sqlScript}"
+
+                                // Extract dynamic table names from  file
+                                def tableNames = readFile("${entity_automation_dir}/tables.diff").trim().split('\n')
+
+                                // Send email notification about entity changes
+                                emailext (
+                                    subject: "DEV OMS Sterling - Build Entity Changes Detected in ${env.JOB_NAME} - Build #${env.BUILD_NUMBER}",
+                                    body: """
+                                    <html>
+                                    <body style="font-family: Arial, sans-serif; color: #333;">
+                                        <h2 style="color: #3333ff;">Entity Changes Detected</h2>
+                                        <p>Dear Team,</p>
+                                        <p><b>Job Name:</b> ${env.JOB_NAME}</p>
+                                        <p><b>Build Number:</b> ${env.BUILD_NUMBER}</p>
+                                        <p>Entity changes have been detected in DEV OMS Build for the following tables:</p>
+                                        <ul style="background-color: #f9f9f9; padding: 10px; border: 1px solid #ddd;">
+                                            ${tableNames.collect { "<li>" + it + "</li>" }.join('')}
+                                        </ul>
+                                        <p>Below is the SQL script for the entity changes:</p>
+                                        <pre style="background-color: #f0f0f0; padding: 10px; border: 1px solid #ddd;">
+${sqlScript}
+                                        </pre>
+                                        <p style="color: #cc0000;"><b>The SQL Entity DBCR script execution process will be completed before deployment.</b></p>
+                                        <br>
+                                        <p>Best Regards,</p>
+                                        <p>DevOps Team - Jenkins</p>
+                                    </body>
+                                    </html>
+                                    """,
+                                    mimeType: 'text/html',
+                                    to: "<email Ids >"
+                                )
+                                // Execute the DBCR Script 
+
+                            } else {
+                                error "DB verify script failed with exit code ${result}."
+                            }
+                        } else {
+                            echo "No Entity Changes on this Deployment"
+                        }   
+                    } catch (Exception e) {
+                        error("Failed on Handling Entity Changes: ${e.message}")
+                    }
+                }
+            }
+        }
+        stage('Call Ripple Restart Job'){
+            steps {
+                // Run the RIPPLERESTART_WAS_CLUSTER Jenkins Job with parameters
+                build job: 'OMS10_SCM_5_RIPPLERESTART_WAS_CLUSTER'
+            }
+        }
+        stage('Call SSS Job') {
+            steps {
+                script {
+                    // Run the SSS Jenkins Job with parameters
+                    build job: 'OMS10_SCM_3_AGNT_INTG_STOP_SETUP_START', parameters: [
+                        booleanParam(name: 'STOP_ALL', value: true),
+                        booleanParam(name: 'SETUP_AGENT_BOX', value: true),
+                        booleanParam(name: 'START_ALL', value: true)
+                    ]
+                }
+            }
+        }
+    }
+}

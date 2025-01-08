@@ -1,0 +1,261 @@
+////////////////////////////////////////////////////////
+// Jenkins pipeline for STERLING SMCFS Build         
+// Label Maintainer: Saravanan V   
+////////////////////////////////////////////////////////
+// Please Dont edit this startAntBuild function
+def startAntBuild() {
+    def ANT_BUILD_FILE = '/opt/OMS/Build/build_dev_oms10.xml' // Specify the XML as per the Environment
+    return sh(script: "${ant_home}/bin/ant -f ${ANT_BUILD_FILE} buildAll -Dcustomcode=${params.build_customcode_jar} -Dresources=${params.build_resources_jar} -Dentity=${params.build_entity_jar} -Dbuildear=${params.build_ear}", returnStatus: true)
+    // return sh(script: "${ant_home}/bin/ant -f ${ANT_BUILD_FILE} buildAll", returnStatus: true)
+}
+//////////////////////////////////////////////////////////////////////////////////
+def app_node_ips = [
+    node_01: "hostname", 
+    // node_02: "IP-Address"
+]
+def agnt_node_ips = [
+    node_01: "hostname", 
+    node_02: "hostname", 
+    // node_03: "IP-Address"
+]
+
+pipeline {
+    agent {
+        label "<Agent Label Name>"
+    }
+
+    options {
+        disableConcurrentBuilds()
+    }
+
+    parameters {
+        booleanParam(name: 'build_customcode_jar', defaultValue: true, description: 'Perform customcode jar build')
+        booleanParam(name: 'build_resources_jar', defaultValue: true, description: 'Perform resources jar build')
+        booleanParam(name: 'build_entity_jar', defaultValue: true, description: 'Perform entity jar build')
+        booleanParam(name: 'build_ear', defaultValue: true, description: 'Perform EAR build' )
+        booleanParam(name: 'git_update_flag', defaultValue: true, description: 'Fetch files from Git repository')
+        string(name: 'git_branch_name', defaultValue: 'temp_release_DEV10AEL', description: 'Git Repository Branch Name')
+        string(name: 'git_release_tag', defaultValue: '', description: 'Publish the Branch\'s Release Tag to the Git Repo.')
+        booleanParam(name: 'DEPLOY_APP_NODES', defaultValue: true, description: 'Perform deployment on AppServers')
+        booleanParam(name: 'DEPLOY_AGNT_INTG_NODES', defaultValue: true, description: 'Perform deployment on AgentServers')
+    }
+
+    environment {
+        sterling_dir = "/opt/IBM/OMS10/"                                // Specify the STERLING Foundation directory 
+        ant_home = "/usr/local/ant/"                                    // Specify the path to your Ant installation for smcfs.ear build
+        git_sub_dir = "OMS_GIT"                                         // Custom folder for Git checkout
+        properties_env="dev"                                            // Specify the Env folder (dev|uat|prod|dr) as per the Git Folder strategy
+        ssh_user = "omsadmin"                                           // Specify the SSH username of APP Nodes and AGENT nodes
+        dmgr_user= "omsadmin"                                           // Specify the SSH username of DMGR Node
+        dmgr_node= "hostname"                                         // Specify the IP of DMGR Node
+        build_artifacts_dir = "${sterling_dir}/external_deployments"    // No change required
+        build_version_number = "${params.git_release_tag?.trim() && params.git_release_tag =~ /^[0-9]+$/ ? params.git_release_tag : env.BUILD_TIMESTAMP}"
+    }
+    
+    stages {
+        stage('Build Detail') {
+            steps { 
+                script {
+                    app_servers = []
+                    app_node_ips.each { key, value ->
+                        app_servers.add(value)
+                    }
+                    agnt_servers = []
+                    agnt_node_ips.each { key, value ->
+                        agnt_servers.add(value)
+                    }
+                    def outputMessage = """
+Git Branch Name       : ${params.git_branch_name}
+Git Fetch Files       : ${params.git_update_flag}
+Build CustomCode JAR  : ${params.build_customcode_jar}
+Build Resources JAR   : ${params.build_resources_jar}
+Build Entities JAR    : ${params.build_entity_jar}
+Build EAR             : ${params.build_ear}
+AppServer Nodes       : ${app_servers.join(', ')}
+AgentServer Nodes     : ${agnt_servers.join(', ')}
+Build Release Tag     : ${env.build_version_number}
+Deploy App Nodes      : ${params.DEPLOY_APP_NODES}
+Deploy Agent Nodes    : ${params.DEPLOY_AGNT_INTG_NODES}
+                    """
+                    echo outputMessage
+                }
+            }
+        }
+
+        stage('Git Checkout') {
+            steps {
+                script {
+                    try {
+                        // Execute the GIT Checkout in custom workspace
+                        dir(build_artifacts_dir) {
+                            // Checkout Git repository into the subdirectory with credentials
+                            def GIT_REPO_URL = 'Git Repo Link'
+                            def GIT_CREDENTIALS_ID = 'Git Repo Jenkins Access Cred ID'
+                            if (params.git_update_flag) {
+                                checkout([$class: 'GitSCM', branches: [[name: params.git_branch_name]], doGenerateSubmoduleConfigurations: false,
+                                extensions: [[$class: 'RelativeTargetDirectory', relativeTargetDir: git_sub_dir]],
+                                userRemoteConfigs: [[url: GIT_REPO_URL, credentialsId: GIT_CREDENTIALS_ID]]
+                                ])
+                            }
+                        }
+                        dir("${build_artifacts_dir}/${git_sub_dir}") {
+                            def tagName = "${env.build_version_number}"
+                            def credentialsId = 'Git Repo Jenkins Access Cred ID'
+                            withCredentials([usernamePassword(credentialsId: credentialsId, usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
+                                def gitRepoUrl = "https://${USERNAME}:${PASSWORD}@github.com/AELDM/OMS.git"
+                                sh "git tag -a -f -m 'Jenkins automated Release tagging for build - ${tagName}' ${tagName}"
+                                sh "git push ${gitRepoUrl} ${tagName}"
+                            }
+                        }
+                    } catch (Exception e) {
+                        error("Failed to checkout from Git: ${e.message}")
+                    }
+                }
+            }
+        }
+
+        stage('Copy repo changes to App & Agent Nodes') {
+            steps {
+                script {
+                    try {
+                        echo " Compressing the extensions folder to a zip file for Appserver"
+                        sh """
+                            cd ${build_artifacts_dir}/${git_sub_dir}/extensions && zip -r extensions.zip .
+                        """
+                        def app_servers_props_parallelBranches = [:]
+                            app_servers.each { node ->
+                                app_servers_props_parallelBranches[node] = {
+                                    catchError {
+                                        echo "Copying extensions.zip and properties & Jasper folder files to appserver node: ${node}"
+                                        sh """
+                                            scp -r ${build_artifacts_dir}/${git_sub_dir}/properties/${properties_env}/*.* ${ssh_user}@${node}:/home/${ssh_user}/properties/${git_sub_dir}/properties/${properties_env}/
+                                            scp -r ${build_artifacts_dir}/${git_sub_dir}/extensions/*.* ${ssh_user}@${node}:/home/${ssh_user}/extensions/${git_sub_dir}/extensions
+                                            scp -r ${build_artifacts_dir}/${git_sub_dir}/jasperreports/templates/*.* ${ssh_user}@${node}:/home/${ssh_user}/jasperreports/${git_sub_dir}/jasperreports/templates/
+                                        """
+                                        echo "Successfully copied extensions.zip and properties & Jasper folder files to appserver node: ${node}"
+                                    }
+                                }
+                            }
+                        def agnt_servers_props_parallelBranches = [:]
+                            agnt_servers.each { node ->
+                                agnt_servers_props_parallelBranches[node] = {
+                                    catchError {
+                                        echo "Copying properties & Jasper folder files to agentserver node: ${node}"
+                                        sh """
+                                            scp -r ${build_artifacts_dir}/${git_sub_dir}/properties/${properties_env}/*.* ${ssh_user}@${node}:/home/${ssh_user}/properties/${git_sub_dir}/properties/${properties_env}/
+                                            scp -r ${build_artifacts_dir}/${git_sub_dir}/jasperreports/templates/*.* ${ssh_user}@${node}:/home/${ssh_user}/jasperreports/${git_sub_dir}/jasperreports/templates/
+                                        """
+                                        echo "Successfully copied properties & Jasper folder files to agentserver node: ${node}"
+                                    }
+                                }
+                            }
+                        parallel app_servers_props_parallelBranches
+                        parallel agnt_servers_props_parallelBranches
+                    } catch (Exception e) {
+                        error("Failed to Copy repo changes to App & Agent Nodes: ${e.message}")
+                    }
+                }
+            }
+        }
+
+        stage('Build Process') {
+            steps {
+                script {
+                    try {
+                        // Start Ant build
+                        echo "Starting Ant build..."
+                        def antBuildResult = startAntBuild()
+
+                        // Print some debug information
+                        echo "Ant build completed with exit code: ${antBuildResult}"
+
+                        // Check the build result
+                        if (antBuildResult != 0) {
+                            error "Ant build failed with exit code ${antBuildResult}"
+                        }
+                    } catch (Exception e) {
+                        // If the build is manually stopped, interrupt the executor
+                        // ***************Need Admin approval for this script block *****************************
+                        // if (currentBuild.rawBuild.executor != null) {
+                        //     echo "Jenkins job manually stopped. Attempting to interrupt the Ant process..."
+                        //     currentBuild.rawBuild.executor.interrupt(Result.ABORTED)
+                        // }
+                        // **************************************************************************************
+                        error "Failed to execute Ant build: ${e.message}"
+                    }
+                }
+            }
+        }
+
+        stage('Copy Artifacts to App, Dmgr & Agent Nodes') {
+            steps {
+                script {
+                    try {
+                        def app_servers_artifacts_parallelBranches = [:]
+                        app_servers.each { node ->
+                            app_servers_artifacts_parallelBranches[node] = {
+                                catchError {
+                                    echo "Copying the smcfs.ear and ejb.jar to appserver node: ${node}"
+                                    sh """
+                                        scp -r ${build_artifacts_dir}/smcfs.ear ${ssh_user}@${node}:/home/${ssh_user}/ear/
+                                        scp -r ${build_artifacts_dir}/smcfsejb.jar ${ssh_user}@${node}:/home/${ssh_user}/ear/
+                                        scp -r ${build_artifacts_dir}/*.jar ${ssh_user}@${node}:/home/${ssh_user}/jars/
+                                    """
+                                    echo "Successfully copied the smcfs.ear and ejb.jar to appserver node: ${node} "
+                                }
+                            }
+                        }
+                        def agnt_servers_artifacts_parallelBranches = [:]
+                        agnt_servers.each { node ->
+                            agnt_servers_artifacts_parallelBranches[node] = {
+                                catchError {
+                                    echo "Copying artifacts jar files to agentserver node: ${node}"
+                                    sh """
+                                        scp -r ${build_artifacts_dir}/*.jar ${ssh_user}@${node}:/home/${ssh_user}/jars/
+                                    """
+                                    echo "Successfully copied artifacts jar files to agentserver node: ${node}"
+                                }
+                            }
+                        }
+                        parallel app_servers_artifacts_parallelBranches
+                        parallel agnt_servers_artifacts_parallelBranches
+                        // Copy Artifacts smcfs.ear and EJB.jar to Dmgr
+                        echo "Copying the smcfs.ear and ejb.jar to Dmgr node: ${dmgr_node}"
+                        sh """
+                            #ssh ${dmgr_user}@${dmgr_node} "sh /home/${dmgr_user}/script/backupLastBuildEar.sh" #Commenting this on DEV and UAT 
+                            scp -r ${build_artifacts_dir}/smcfs.ear ${dmgr_user}@${dmgr_node}:/home/${dmgr_user}/ear/
+                            scp -r ${build_artifacts_dir}/smcfsejb.jar ${dmgr_user}@${dmgr_node}:/home/${dmgr_user}/ear/
+                        """
+                        echo "Successfully copied the smcfs.ear and ejb.jar to Dmgr node: ${dmgr_node} "
+                    } catch (Exception e) {
+                        error("Failed to Copy Artifacts to App & Agent Nodes: ${e.message}")
+                    }
+                }
+            }
+        }
+        stage('Call ZDT Deploy Job'){
+            when {
+                expression {params.DEPLOY_APP_NODES == true}
+            }
+            steps {
+                // Run the RIPPLERESTART_WAS_CLUSTER Jenkins Job with parameters
+                build job: 'OMS10_SCM_2_ZDT_EAR_DEPLOY'
+            }
+        }
+        stage('Call Agent SSS Job') {
+            when {
+                expression {params.DEPLOY_AGNT_INTG_NODES == true}
+            }
+            steps {
+                script {
+                    // Run the SSS Jenkins Job with parameters
+                    build job: 'OMS10_SCM_3_AGNT_INTG_STOP_SETUP_START', parameters: [
+                        booleanParam(name: 'STOP_ALL', value: true),
+                        booleanParam(name: 'SETUP_AGENT_BOX', value: true),
+                        booleanParam(name: 'START_ALL', value: true)
+                    ]
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,75 @@
+/////////////////////////////////////////////////////////////
+// Jenkins pipeline for rippleRestart WebSphere Cluster    
+// Label Maintainer: Saravanan V    
+/////////////////////////////////////////////////////////////
+def app_node_ips = [
+    node_01: "hostname", 
+    // node_02: "IP-Address"
+]
+pipeline {
+    agent {
+        label '<Agent Label Name>'
+    }
+    options {
+        disableConcurrentBuilds()
+    }
+    environment {
+        // Replace the values as per the environment
+        sterling_dir = "/opt/IBM/OMS10"                             // Specify the STERLING Foundation directory
+        ssh_user = "omsadmin"                                       // Specify the SSH username of APP Nodes
+        dmgr_node = "hostname"                                    // Specify the IP of DMGR Node
+        dmgr_user = "omsadmin"                                      // Specify the SSH username of DMGR Node
+        dmgr_dir = "/opt/IBM/WebSphere/AppServer9/profiles/Dmgr01"  // Specify the WAS DMGR profile directory
+        jython_ZDT_script = "/opt/IBM/script/rippleRestart_V2.py"   // Specify the WAS wsadmin py script
+        db_client_node = "hostname"                               // Specify the IP of DB Client connection Node
+        dbscripts_dir = "/home/omsadmin/scripts/clear-heartbeat"    // Specify the DB stale scripts directory
+    }
+    stages {
+        stage('RippleRestart') {
+            parallel {
+                stage('DB Handler') {
+                    steps {
+                        script {
+                            try {
+                                sh """
+                                    ssh ${ssh_user}@${db_client_node} "sh ${dbscripts_dir}/clear-db-stales-APP.sh"
+                                """
+                            } catch (Exception e) {
+                                error("Failed to Clear DB stale entries : ${e.message}")
+                            }
+                        }
+                    }
+                }
+                stage('Cluster RippleRestart') {
+                    steps {
+                        script {
+                            try {
+                                sleep time: 30, unit: 'SECONDS'
+                                sh """
+                                    ssh ${dmgr_user}@${dmgr_node} "sh ${dmgr_dir}/bin/wsadmin.sh -conntype SOAP -user configadmin -password configadmin -lang jython -f ${jython_ZDT_script}"
+                                """
+                            } catch (Exception e) {
+                                error("Failed to execute ZDT Deploy: ${e.message}")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    post {
+        always {
+            echo 'Executing cleanup stage: Killing clear-db-stales-APP.sh processes.'
+            // Run the script to kill the process
+            script {
+                try {
+                    sh """
+                        ssh ${ssh_user}@${db_client_node} "sh ${dbscripts_dir}/post-jenkins.sh"
+                    """
+                } catch (Exception e) {
+                    error("Failed to kill clear-db-stales-APP.sh processes  : ${e.message}")
+                }
+            }
+        }
+    }
+}

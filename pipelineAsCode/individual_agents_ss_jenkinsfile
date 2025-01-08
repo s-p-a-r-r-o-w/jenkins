@@ -1,0 +1,192 @@
+/////////////////////////////////////////////////////////////
+// Jenkins pipeline for Agents and Integrations restart   
+// Label Maintainer: Saravanan V     
+/////////////////////////////////////////////////////////////
+def agnt_servers
+def agent_servers
+def agnt_node_ips = [
+    node_01: "hostname", 
+    node_02: "hostname", 
+    // node_03: "IP-Address" // HostName
+]
+ 
+
+pipeline {
+    agent {
+        label '<Agent Label Name>'
+    }
+    options {
+        disableConcurrentBuilds()
+    }
+    parameters {
+        booleanParam(name: 'GIT_UPDATE_FLAG', defaultValue: true, description: 'Fetch server scripts from Git repository')
+        booleanParam(name: 'STOP_SERVERS', defaultValue: false, description: 'Stop Agent and Integration servers?')
+        booleanParam(name: 'START_SERVERS', defaultValue: false, description: 'Start Agent and Integration servers?')
+        string(name: 'SERVER_NAMES', defaultValue: 'Ex:Agnt Server1, Agnt Server2, Intg Server1', description: 'Enter the name of the agent or integration servers, separated with a comma,')
+    }
+    environment {
+        // Replace the values as per the environment
+        gitRepoBranch = "DEV_AGNTS"                                 // Specify the STERLING agent scripts git repo branch name 
+        agnt_scripts_dir = "/opt/IBM/scripts"                       // Specify the STERLING agent scripts directory 
+        ssh_user = "omsadmin"                                       // Specify the SSH username of AGENT & DB Client connection Nodes
+        healthMonitornode = "hostname"                            // Specify the IP of  HealthMonitor Node
+        db_client_node = "hostname"                               // Specify the IP of DB Client connection Node
+        db_client_user = "omsadmin"                                 // Specify the SSH username of DB Client connection Node
+        dbscripts_dir = "/home/omsadmin/scripts/clear-heartbeat"    // Specify the DB stale scripts directory
+    }
+    stages {
+        stage('Build Detail') {
+            steps { 
+                script {
+                    agnt_servers = [] //List of Agent Server nodes
+                    agnt_node_ips.each { key, value ->
+                        agnt_servers.add(value)
+                    }
+                    def outputMessage = """
+Stopping Process  : ${params.STOP_SERVERS}
+Starting Process  : ${params.START_SERVERS}
+Agent Server Nodes: ${agnt_servers.join(', ')}
+The following servers are included in the Job process:
+Server Names: ${params.SERVER_NAMES}
+                    """
+                    echo outputMessage
+                }
+            }
+        }
+        stage('Git Checkout') {
+            when {
+                expression {params.GIT_UPDATE_FLAG == true}
+            }
+            steps {
+                script {
+                    try {
+                        // Execute the GIT Checkout in custom workspace
+                        // Checkout Git repository into the subdirectory with credentials
+                        def GIT_REPO_URL = 'Git Repo Link'
+                        def GIT_CREDENTIALS_ID = 'Git Repo Jenkins Access Cred ID'
+                        checkout([$class: 'GitSCM',
+                                branches: [[name: gitRepoBranch]], doGenerateSubmoduleConfigurations: false,
+                                extensions: [[$class: 'CloneOption', noTags: true, reference: '', shallow: true, depth: 1,
+                                                sparseCheckoutPaths: [[path: 'Scripts']]]],
+                                userRemoteConfigs: [[url: GIT_REPO_URL, credentialsId: GIT_CREDENTIALS_ID]]
+                        ])
+            
+                    } catch (Exception e) {
+                        error("Failed to checkout from Git: ${e.message}")
+                    }
+                }
+            }
+        }
+        stage('Copy Scripts to Agent Box'){
+            when {
+                expression {params.GIT_UPDATE_FLAG == true}
+            }
+            steps {
+                script{
+                    try {
+                        echo "Copying DB Clear Script to DB Client Node"
+                        sh """scp -r ${WORKSPACE}/Scripts/DB-Scripts/*.sh ${ssh_user}@${db_client_node}:${dbscripts_dir}/"""
+                        def parallelBranches = [:]
+                        agnt_servers.each { node ->
+                            parallelBranches[node] = {
+                                echo "Copying scripts to ${node}"
+                                sh """
+                                    scp -r ${WORKSPACE}/Scripts/${node}.sh ${ssh_user}@${node}:${agnt_scripts_dir}
+                                    scp -r ${WORKSPACE}/Scripts/*orgname_V2.sh ${ssh_user}@${node}:${agnt_scripts_dir}
+                                """
+                                // Insert Source command to the startServers_orgname_V2.sh
+                                sh """
+                                    ssh ${ssh_user}@${node} "sed -i '4s,.*,source ${agnt_scripts_dir}/${node}.sh,' /${agnt_scripts_dir}/startServers_orgname_V2.sh"
+                                """
+                            }
+                        }
+                        parallel parallelBranches
+                    } catch (Exception e) {
+                        error("Failed to copy scripts to Agent boxes: ${e.message}")
+                    }
+                }
+            }
+        }
+        stage('Stop Servers') {
+            when {
+                expression {
+                    params.STOP_SERVERS == true && params.SERVER_NAMES != null && params.SERVER_NAMES != ''
+                }
+            }
+            steps {
+                script {
+                    try {
+                        def serverNames = params.SERVER_NAMES.split(',').collect { it.trim() }
+                        println("Servers undergoing stopping process: ${serverNames}")
+                        agent_servers = [:]
+                        dir("${WORKSPACE}/Scripts") {
+                            serverNames.each { server ->
+                                def nodes = sh(script: "grep -rlw '${server}' | grep -oP '10\\.0\\.\\d+\\.\\d+' || echo ''", returnStdout: true).trim()
+                                if (!nodes) {
+                                    error "Server name '${server}' not found."
+                                }
+                                def nodeArray = nodes.split('\n')
+                                if (server && nodeArray) {
+                                    if (!agent_servers.containsKey(server)) {
+                                        agent_servers[server] = []
+                                    }
+                                    agent_servers[server].addAll(nodeArray)
+                                } else {
+                                    error "Server name '${server}' not found."
+                                }
+                            }
+                        }
+                        agent_servers.each { serverName, nodes ->
+                            nodes.each { node ->
+                                catchError {
+                                    echo "Stopping ${serverName} on node: ${node}"
+                                    sh """
+                                        ssh ${ssh_user}@${node} "sh ${agnt_scripts_dir}/stopServers_orgname_V2.sh SERVER ${serverName}"
+                                    """
+                                }
+                            }
+                        }
+                        sleep time: 5, unit: 'SECONDS'
+                        agent_servers.each { serverName, nodes ->
+                            catchError {
+                                sh """
+                                    ssh ${db_client_user}@${db_client_node} "sh ${env.dbscripts_dir}/clear-db-stales-AGNT.sh SERVER ${serverName}"
+                                """
+                            }
+                        }
+                    } catch (Exception e) {
+                        error("Failed to stop server: ${e.message}")
+                    }
+                }
+            }
+        }
+        stage('Start Servers') {
+            when {
+                expression {
+                    params.START_SERVERS == true &&  params.SERVER_NAMES != null && params.SERVER_NAMES != '' 
+                }
+            }
+            steps {
+                script {
+                    try {
+                        def serverNames = params.SERVER_NAMES.split(',').collect { it.trim() }
+                        println("Servers undergoing restart process: ${serverNames}")
+                        agent_servers.each { serverName, nodes ->
+                            nodes.each { node ->
+                                catchError {
+                                    echo "Starting ${serverName} on node: ${node}"
+                                    sh """
+                                        ssh ${ssh_user}@${node} "sh ${agnt_scripts_dir}/startServers_orgname_V2.sh ${serverName}"
+                                    """
+                                    echo "Started ${serverName} on node: ${node}"
+                                }
+                            }
+                        }
+                    } catch (Exception e) {
+                        error("Failed to Start server: ${e.message}")
+                    }
+                }
+            }
+        }
+    }
+}

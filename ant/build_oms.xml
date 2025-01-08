@@ -115,13 +115,13 @@
 						<jar destfile="${build.home}/jar-extensions/SAP/@{SAPFiles}.jar" basedir="${build.home}/classes" filesetmanifest="mergewithoutmain">
 							<manifest>
 								<attribute name="DependencyFinder" value="main"/>
-								<attribute name="Main-Class" value="in/dmart/commerce/SAP/@{SAPFiles}"/>
+								<attribute name="Main-Class" value="in/orgname/commerce/SAP/@{SAPFiles}"/>
 								<attribute name="Class-Path" value="${build.home}"/>
 								<section name="version-information">
 									<attribute name="Date" value="${dtTimeStamp}"/>
 								</section>
 							</manifest>
-							<fileset dir="${build.home}/classes/in/dmart/commerce/SAP" includes=".class"/>
+							<fileset dir="${build.home}/classes/in/orgname/commerce/SAP" includes=".class"/>
 							<zipfileset src="${oms.dir}/jar/log4j/1_2_17/log4j-1.2.17.jar"/>
 							<zipfileset src="${oms.dir}/dbjar/jdbc/DB2/db2jcc4.jar"/>
 							<zipfileset src="${oms.dir}/dbjar/jdbc/DB2/db2jcc_license_cu.jar"/>

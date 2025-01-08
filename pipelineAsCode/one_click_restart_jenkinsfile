@@ -1,0 +1,58 @@
+////////////////////////////////////////////////////////
+// Jenkins pipeline for STERLING SMCFS Build      
+// Label Maintainer: Saravanan V  
+////////////////////////////////////////////////////////
+pipeline {
+    agent {
+        label "<Agent Label Name>"
+    }
+
+    options {
+        disableConcurrentBuilds()
+    }
+
+    parameters {
+        booleanParam(name: 'RESTART_APP_SERVER', defaultValue: true, description: 'Ripple Restart Application Server Cluster?')
+        booleanParam(name: 'RESTART_AGENT_SERVER', defaultValue: true, description: 'Restart Agent and Integration Servers?')
+    }
+
+    stages {
+        stage('Build Detail') {
+            steps { 
+                script {
+                    def outputMessage = """
+Restart App Servers      : ${params.RESTART_APP_SERVER}
+Restart Agent Servers    : ${params.RESTART_AGENT_SERVER}
+                    """
+                    echo outputMessage
+                }
+            }
+        }
+
+        stage('Call Ripple Restart Job'){
+            when {
+                expression {params.RESTART_APP_SERVER == true}
+            }
+            steps {
+                // Run the RIPPLERESTART_WAS_CLUSTER Jenkins Job with parameters
+                build job: 'OMS10_SCM_5_RIPPLERESTART_WAS_CLUSTER'
+            }
+        }
+
+        stage('Call Agent SSS Job') {
+            when {
+                expression {params.RESTART_AGENT_SERVER == true}
+            }
+            steps {
+                script {
+                    // Run the SSS Jenkins Job with parameters
+                    build job: 'OMS10_SCM_3_AGNT_INTG_STOP_SETUP_START', parameters: [
+                        booleanParam(name: 'STOP_ALL', value: true),
+                        booleanParam(name: 'SETUP_AGENT_BOX', value: false),
+                        booleanParam(name: 'START_ALL', value: true)
+                    ]
+                }
+            }
+        }
+    }
+}

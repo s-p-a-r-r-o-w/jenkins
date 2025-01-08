@@ -1,0 +1,122 @@
+////////////////////////////////////////////////////////
+// Jenkins pipeline for IBM MQ Q Create and Bindings  
+// Label Maintainer: Saravanan V  
+////////////////////////////////////////////////////////
+
+pipeline {
+    agent {
+        label "<Agent Label Name>"
+    }
+
+    options {
+        disableConcurrentBuilds()
+    }
+
+    parameters {
+        booleanParam(name: 'CREATE_QUEUE', defaultValue: false, description: 'Create JMS Queues?')
+        booleanParam(name: 'CREATE_BINDING', defaultValue: false, description: 'Create JMS Bindings?')
+        string(name: 'QUEUE_NAMES', defaultValue: 'Ex: Q_Name1:OMS,Q_Name2:WMS,Q_Name', description: 'Enter the name of the queues [UPPERCASE ONLY], separated with a comma,')
+    }
+
+    environment {
+        ibm_mq_dir = "/opt/queue/jenkins"                               // Specify the MQ Automation directory 
+        ibm_mq_conf_dir = "/opt/queue"
+        mq_user= "mqm"                                                  // Specify the SSH username of MQ Node
+        mq_node= "mqhostname"                                            // Specify the IP of MQ Node
+        mq_qmgrname= "UATMQ"                                            // Specify the Queue Manager 
+        gitRepoBranch = "mq-dev"
+    }
+    
+    stages {
+        stage('Build Detail') {
+            steps { 
+                script {
+                    def outputMessage = """
+Create Queues   : ${params.CREATE_QUEUE}
+Create Bindings : ${params.CREATE_BINDING}
+Queue Names     : ${params.QUEUE_NAMES}
+                    """
+                    echo outputMessage
+                }
+            }
+        }
+
+        stage('Git MQ Script Update') {
+            steps {
+                script {
+                    try {
+                        // Checkout Git repository into the subdirectory with credentials
+                        checkout([$class: 'GitSCM', branches: [[name: gitRepoBranch]], 
+                            doGenerateSubmoduleConfigurations: false,
+                            extensions: [[$class: 'RelativeTargetDirectory', relativeTargetDir: 'GIT']],
+                            userRemoteConfigs: [[url: 'Git Repo Link', 
+                                credentialsId: 'Git Repo Jenkins Access Cred ID']]
+                        ])
+                        echo "Copying MQ Scripts to IBM MQ Node"
+                        sh """
+                        ssh ${mq_user}@${mq_node} "mkdir -p /opt/queue/{bindings,jenkins}"
+                        scp -r ${WORKSPACE}/GIT/mqscripts/.env ${mq_user}@${mq_node}:${ibm_mq_dir}/
+                        scp -r ${WORKSPACE}/GIT/mqscripts/* ${mq_user}@${mq_node}:${ibm_mq_dir}/
+                        scp -r ${WORKSPACE}/GIT/mqconfig/* ${mq_user}@${mq_node}:${ibm_mq_conf_dir}/  
+                        """
+                    } catch (Exception e) {
+                        error("Failed to Copy scripts from Git to MQ Node : ${e.message}")
+                    }
+                }
+            }
+        }
+        
+        stage('Makefiles') {
+            steps {
+                script {
+                    try {
+                        echo " @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@  IBM MQ Makefiles @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@ "
+                        // Sanitize the QUEUE_NAMES parameter
+                        def sanitizedQueueNames = params.QUEUE_NAMES.replaceAll(/\s/, "").replaceAll(/,$/, "")
+                        sh"""
+                        ssh ${mq_user}@${mq_node} "export QUEUE_NAMES=${sanitizedQueueNames} && ${ibm_mq_dir}/makefiles.sh" 
+                        """
+                    } catch (Exception e) {
+                        error("Failed to makefiles for IBM MQ Automation: ${e.message}")
+                    }
+                }
+            }
+        }
+
+        stage('Queue Creation') {
+            when {
+                expression {params.CREATE_QUEUE == true}
+            }
+            steps {
+                script {
+                    try {
+                        echo " @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@  IBM MQ Queue Creation @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@ "
+                        sh"""
+                        ssh ${mq_user}@${mq_node} "sh ${ibm_mq_dir}/createQueues.sh ${mq_qmgrname}" 
+                        """
+                    } catch (Exception e) {
+                        error "Failed to create queues: ${e.message}"
+                    }
+                }
+            }
+        }
+
+        stage('Update Bindings') {
+            when {
+                expression {params.CREATE_BINDING == true}
+            }
+            steps {
+                script {
+                    try {
+                        echo " @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@  IBM MQ Binding Creation and Upload to APP and Agent Nodes @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@ "
+                        sh"""
+                        ssh ${mq_user}@${mq_node} "sh ${ibm_mq_dir}/createBindings.sh"
+                        """
+                    } catch (Exception e) {
+                        error("Failed to create bindings and Upload to APP and Agent Nodes: ${e.message}")
+                    }
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,432 @@
+////////////////////////////////////////////////////////
+// Jenkins pipeline for STERLING SMCFS Build        
+// Label Maintainer: Saravanan V   
+////////////////////////////////////////////////////////
+// Please don't edit this startAntBuild function
+def startAntBuild() {
+    def ANT_BUILD_FILE = '/opt/OMS/Build/build_oms.xml' // Specify the XML as per the Environment
+    return sh(script: "${ant_home}/bin/ant -f ${ANT_BUILD_FILE} buildAll -Dcustomcode=true -Dresources=true -Dentity=true -Dbuildear=true", returnStatus: true)
+}
+
+def app_node_ips = [
+    node_01: "hostname", 
+    // node_02: "IP-Address"
+]
+def agnt_node_ips = [
+    node_01: "hostname", 
+    node_02: "hostname", 
+    // node_03: "IP-Address"
+]
+
+pipeline {
+    agent {
+        label "<Agent Label Name>"
+    }
+
+    options {
+        disableConcurrentBuilds()
+    }
+
+    parameters {
+        string(name: 'GIT_BRANCH_NAME', defaultValue: 'DEV_DEPLOY', description: 'Git Repository Branch Name')
+        booleanParam(name: 'DEPLOY_APP_NODES', defaultValue: false, description: 'Perform deployment on AppServers?')
+        booleanParam(name: 'DEPLOY_AGNT_INTG_NODES', defaultValue: false, description: 'Perform deployment on AgentServers?')
+    }
+
+    environment {
+        sterling_dir = "/opt/IBM/OMS10/"                                // Specify the STERLING Foundation directory 
+        ant_home = "/usr/local/ant/"                                    // Specify the path to your Ant installation for smcfs.ear build
+        git_sub_dir = "OMS_GIT"                                         // Custom folder for Git checkout
+        properties_env="dev"                                            // Specify the Env folder (dev|uat|prod|dr) as per the Git Folder strategy
+        ssh_user = "omsadmin"                                           // Specify the SSH username of APP Nodes and AGENT nodes
+        dmgr_user = "omsadmin"                                          // Specify the SSH username of DMGR Node
+        dmgr_node = "hostname"                                        // Specify the IP of DMGR Node
+        mq_user = "mqm"                                                 // Specify the SSH username of MQM Node
+        mq_node = "mqhostname"                                           // Specify the IP of MQM Node
+        qmgr_name = "UATMQ"                                             // Specify the QMGR name
+        git_commit_txt = "/opt/jenkins/GIT_Commit/dev_oms_last_commit.txt" // Change Required 
+        git_clone_dir = "/opt/jenkins"                                  // No change required
+        entity_automation_dir = "${git_clone_dir}/entity_automation"    // No change required
+        mq_automation_dir = "${git_clone_dir}/mq_automation"            // No change required
+        build_artifacts_dir = "${sterling_dir}/external_deployments"    // No change required
+    }
+    
+    stages {
+        stage('Build Detail') {
+            steps { 
+                script {
+                    app_servers = []
+                    app_node_ips.each { key, value ->
+                        app_servers.add(value)
+                    }
+                    agnt_servers = []
+                    agnt_node_ips.each { key, value ->
+                        agnt_servers.add(value)
+                    }
+                    def outputMessage = """
+Git Branch Name       : ${params.GIT_BRANCH_NAME}
+AppServer Nodes       : ${app_servers.join(', ')}
+AgentServer Nodes     : ${agnt_servers.join(', ')}
+Deploy App Nodes      : ${params.DEPLOY_APP_NODES}
+Deploy Agent Nodes    : ${params.DEPLOY_AGNT_INTG_NODES}
+                    """
+                    echo outputMessage
+                }
+            }
+        }
+
+        stage('Git Checkout') {
+            steps {
+                script {
+                    try {
+                        // Execute the GIT Checkout in custom workspace
+                        dir(git_clone_dir) {
+                            def GIT_REPO_URL = 'Git Repo Link'
+                            def GIT_CREDENTIALS_ID = 'Git Repo Jenkins Access Cred ID'
+                            checkout([$class: 'GitSCM', branches: [[name: params.GIT_BRANCH_NAME]], doGenerateSubmoduleConfigurations: false,
+                            extensions: [[$class: 'RelativeTargetDirectory', relativeTargetDir: git_sub_dir]],
+                            userRemoteConfigs: [[url: GIT_REPO_URL, credentialsId: GIT_CREDENTIALS_ID]]
+                            ])
+                        }
+                        sleep time: 30, unit: 'SECONDS'
+                    } catch (Exception e) {
+                        error("Failed to checkout from Git: ${e.message}")
+                    }
+                }
+            }
+        }
+
+        stage('Build Process') {
+            steps {
+                script {
+                    try {
+                        // Start Ant build
+                        echo "Starting Ant build..."
+                        def antBuildResult = startAntBuild()
+
+                        // Print some debug information
+                        echo "Ant build completed with exit code: ${antBuildResult}"
+
+                        // Check the build result
+                        if (antBuildResult != 0) {
+                            error "Ant build failed with exit code ${antBuildResult}"
+                        }
+                    } catch (Exception e) {
+                        error "Failed to execute Ant build: ${e.message}"
+                    }
+                }
+            }
+        }
+        stage('Handling Entity Changes') {
+            steps {
+                script {
+                    try {
+                        // Identify Entity Changes
+                        dir("${git_clone_dir}/${git_sub_dir}") {
+                            sh "rm -fr ${entity_automation_dir}/*"
+                            def last_commit = sh(script: "cat ${git_commit_txt}", returnStdout: true).trim()
+                            // Get the diff only on the directory entities from Git.
+                            def diff = sh(script: "git diff ${last_commit}..HEAD -- extensions/global/entities", returnStdout: true).trim()
+                            // Write the diff to a file
+                            writeFile file: "${entity_automation_dir}/changes.diff", text: diff
+                            // Check if columns.txt file is not empty
+                            def columnsExist = sh(script: "test -s ${entity_automation_dir}/changes.diff && echo 'exists' || echo 'not exists'", returnStdout: true).trim()
+
+                            if (columnsExist == "exists") {
+                                // Write "true" into ${entity_automation_dir}/entity.flag
+                                sh "echo 'true' > ${entity_automation_dir}/entity.flag"
+                                // Copy Changes and dependent files to Appserver Node
+                                sh """
+                                    scp ${entity_automation_dir}/changes.diff ${entity_automation_dir}/entity.flag ${ssh_user}@${app_node_ips.node_01}:${entity_automation_dir}
+                                """
+                            } else {
+                                // Print message if no entity changes
+                                echo "No entity changes on this build."
+                                // Write "false" into entity.flag
+                                sh "echo 'false' > ${entity_automation_dir}/entity.flag"
+                                // Copy Changes and dependent files to Appserver Node
+                                sh """
+                                    scp ${entity_automation_dir}/changes.diff ${entity_automation_dir}/entity.flag ${ssh_user}@${app_node_ips.node_01}:${entity_automation_dir}
+                                """
+                            }
+                        }
+                    } catch (Exception e) {
+                        error("An error occurred on Handling Entity Changes: ${e.message}")
+                    }
+                }
+            }
+        }
+        stage('Handling JMS Queues') {
+            steps {
+                script {
+                    try {
+                        // Define paths for the files
+                        def jmsListFile = "${mq_automation_dir}/jms.list"
+                        def jmsRequestFile = "${git_clone_dir}/${git_sub_dir}/jms/jms.request"
+                        def omsBindingListFile = "${mq_automation_dir}/OMSDEV.bindings"
+                        def wmsBindingListFile = "${mq_automation_dir}/WMSDEV.bindings"
+
+                        // Call the script to get the latest jms.list
+                        sh "ssh ${mq_user}@${mq_node} 'sh /opt/queue/jenkins/makeJMSList.sh ${qmgr_name}'"
+                        sh "scp ${mq_user}@${mq_node}:/opt/queue/jms.list ${jmsListFile}"
+                        sh "scp ${mq_user}@${mq_node}:/opt/queue/bindings/OMSDEV.bindings ${omsBindingListFile}"
+                        sh "scp ${mq_user}@${mq_node}:/opt/queue/bindings/WMSDEV.bindings ${wmsBindingListFile}"
+
+                        // Load the contents of the files
+                        def jmsListContent = readFile(jmsListFile).split("\n")
+                        def jmsRequestContent = readFile(jmsRequestFile).split("\n")
+                        def omsBindingContent = readFile(omsBindingListFile).split("\n")
+                        def wmsBindingContent = readFile(wmsBindingListFile).split("\n")
+
+                        // Parse the queue names from the files, ensuring proper trimming and converting to uppercase
+                        def jmsListQueues = jmsListContent.collect { it.trim().toUpperCase() }.findAll { it }
+                        //def jmsRequestQueues = jmsRequestContent.collect { it.trim().toUpperCase() }.findAll { it }
+                        def jmsRequestQueues = []
+                        for (int i = 1; i < jmsRequestContent.size(); i++) {
+                            def line = jmsRequestContent[i].trim()
+                            if (line) {
+                                jmsRequestQueues << line.toUpperCase()
+                            }
+                        }
+                        def omsBindingQueues = omsBindingContent.collect { it.split("/")[0].trim().toUpperCase() }.findAll { it }
+                        def wmsBindingQueues = wmsBindingContent.collect { it.split("/")[0].trim().toUpperCase() }.findAll { it }
+
+                        // Find queues from jms.request that are not in jms.list
+                        def missingQueues = jmsRequestQueues.findAll { !jmsListQueues.contains(it) }
+                        // Find queues from jms.request that are not in OMSDEV.bindings
+                        def omsMissingBindings = jmsRequestQueues.findAll { !omsBindingQueues.contains(it) }
+                        // Find queues from jms.request that are not in WMSDEV.bindings
+                        def wmsMissingBindings = jmsRequestQueues.findAll { !wmsBindingQueues.contains(it) }
+
+                        if (missingQueues) {
+                            // Trigger job for creating queues
+                            println "Calling IBM MQ Queue Creation Jenkins Job for Queues: ${missingQueues}"
+                            def queueNames = missingQueues.join(',')
+                            build job: 'IBM_MQ_QUEUE_N_BINDING_CREATION_DEV', parameters: [
+                                booleanParam(name: 'CREATE_QUEUE', value: true),
+                                booleanParam(name: 'CREATE_BINDING', value: false),
+                                string(name: 'QUEUE_NAMES', value: queueNames)
+                            ]
+                            // Re-fetch the latest files
+                            sh "ssh ${mq_user}@${mq_node} 'sh /opt/queue/jenkins/makeJMSList.sh ${qmgr_name}'"
+                            sh "scp ${mq_user}@${mq_node}:/opt/queue/jms.list ${jmsListFile}"
+                            // Load the contents of the latest files
+                            def latestJmsListContent = readFile(jmsListFile).split("\n")
+                            // Parse the queue names from the latest files, ensuring proper trimming and converting to uppercase
+                            def latestJmsListQueues = latestJmsListContent.collect { it.trim().toUpperCase() }.findAll { it }
+                            // Check if the missing queues are now present in the latest files
+                            def missingQueuesNowPresent = missingQueues.every { latestJmsListQueues.contains(it) }
+                            // Output the results
+                            println "All Requested queues now present in IBM MQ Server: ${missingQueuesNowPresent}"
+                        } else {
+                            println "No new queues to create"
+                        }
+
+                        if (omsMissingBindings) {
+                            // Trigger job for creating OMS bindings
+                            println "Calling IBM MQ Queue Creation Jenkins Job for OMS Bindings: ${omsMissingBindings}"
+                            def omsQueueNames = omsMissingBindings.collect { it + ':OMS' }.join(',')
+                            build job: 'IBM_MQ_QUEUE_N_BINDING_CREATION_DEV', parameters: [
+                                booleanParam(name: 'CREATE_QUEUE', value: false),
+                                booleanParam(name: 'CREATE_BINDING', value: true),
+                                string(name: 'QUEUE_NAMES', value: omsQueueNames)
+                            ]
+                            sh "scp ${mq_user}@${mq_node}:/opt/queue/bindings/OMSDEV.bindings ${omsBindingListFile}"
+                            def latestOmsBindingContent = readFile(omsBindingListFile).split("\n")
+                            def latestOmsBindingQueues = latestOmsBindingContent.collect { it.split("/")[0].trim().toUpperCase() }.findAll { it }
+                            def omsMissingBindingsNowPresent = omsMissingBindings.every { latestOmsBindingQueues.contains(it) }
+                            println "All Requested queues bindings now present in OMSDEV.bindings: ${omsMissingBindingsNowPresent}"
+                        } else {
+                            println "No new OMS bindings to create"
+                        }
+
+                        if (wmsMissingBindings) {
+                            // Trigger job for creating WMS bindings
+                            println "Calling IBM MQ Queue Creation Jenkins Job for OMS Bindings: ${wmsMissingBindings}"
+                            def wmsQueueNames = wmsMissingBindings.collect { it + ':WMS' }.join(',')
+                            build job: 'IBM_MQ_QUEUE_N_BINDING_CREATION_DEV', parameters: [
+                                booleanParam(name: 'CREATE_QUEUE', value: false),
+                                booleanParam(name: 'CREATE_BINDING', value: true),
+                                string(name: 'QUEUE_NAMES', value: wmsQueueNames)
+                            ]
+                            sh "scp ${mq_user}@${mq_node}:/opt/queue/bindings/WMSDEV.bindings ${wmsBindingListFile}"
+                            def latestWmsBindingContent = readFile(wmsBindingListFile).split("\n")
+                            def latestWmsBindingQueues = latestWmsBindingContent.collect { it.split("/")[0].trim().toUpperCase() }.findAll { it }
+                            def wmsMissingBindingsNowPresent = wmsMissingBindings.every { latestWmsBindingQueues.contains(it) }
+                            println "All Requested queues bindings now present in WMSDEV.bindings: ${wmsMissingBindingsNowPresent}"
+                        } else {
+                            println "No new WMS bindings to create"
+                        }
+                        // Git Push block
+                        dir("${env.git_clone_dir}/${env.git_sub_dir}") {
+                            sh "git checkout ${params.GIT_BRANCH_NAME}"
+                            def date = new Date().format("dd-MMM-yyyy")
+                            sh """
+                                truncate -s 0 ${jmsRequestFile}
+                                echo "# ${date} : To handle the Git merge, always change the datestamp whenever you add new queue names to the jms.request file. This will help identify changes during the Git merge or pull request process." >> ${jmsRequestFile}
+                            """
+                            sh "git add jms/jms.request"
+                            sh "git commit -m 'Automated JMS MQ handler by Jenkins' || echo 'No changes to commit'"
+
+                            def credentialsId = 'Git Repo Jenkins Access Cred ID'
+                            withCredentials([usernamePassword(credentialsId: credentialsId, usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
+                                def gitRepoUrl = "https://${USERNAME}:${PASSWORD}@github.com/AELDM/OMS.git"
+                                sh "git push ${gitRepoUrl} ${params.GIT_BRANCH_NAME} --force"
+                            }
+                        }
+                    } catch (Exception e) {
+                        error("An error occurred in Handle JMS Queues: ${e.message}")
+                    }
+                }
+            }
+        }
+        stage('Copy Artifacts & Repo changes to App | Agent Nodes') {
+            steps {
+                script {
+                    try {
+                        echo "Compressing the extensions folder to a zip file for Appserver"
+                        sh """
+                            cd ${git_clone_dir}/${git_sub_dir}/extensions && zip -rq extensions.zip .
+                        """
+                        echo "The zipping process for extensions has been completed."
+                        sh """
+                            cd ${git_clone_dir}/${git_sub_dir}/jasperreports && zip -rq jasperreports.zip .
+                        """
+                        echo "The zipping process for jasperreports has been completed."
+                        def app_servers_artifacts_parallelBranches = [:]
+                            app_servers.each { node ->
+                                app_servers_artifacts_parallelBranches[node] = {
+                                    catchError {
+                                        echo "Copying extensions.zip and properties & Jasper folder files to appserver node: ${node}"
+                                        sh """
+                                            ssh ${ssh_user}@${node} 'rm -rf /home/${ssh_user}/devOps && mkdir -p /home/${ssh_user}/devOps/{properties,extensions,jasperreports,ear,jars}'
+                                            scp -r ${git_clone_dir}/${git_sub_dir}/properties/${properties_env}/*.* ${ssh_user}@${node}://home/${ssh_user}/devOps/properties/
+                                            scp -r ${git_clone_dir}/${git_sub_dir}/extensions/extensions.zip ${ssh_user}@${node}://home/${ssh_user}/devOps/extensions/
+                                            scp -r ${git_clone_dir}/${git_sub_dir}/jasperreports/jasperreports.zip ${ssh_user}@${node}://home/${ssh_user}/devOps/jasperreports/
+                                            scp -r ${build_artifacts_dir}/smcfs.ear ${ssh_user}@${node}://home/${ssh_user}/devOps/ear/
+                                            scp -r ${build_artifacts_dir}/smcfsejb.jar ${ssh_user}@${node}://home/${ssh_user}/devOps/ear/
+                                            scp -r ${build_artifacts_dir}/*.jar ${ssh_user}@${node}://home/${ssh_user}/devOps/jars/
+                                        """
+                                        echo "Successfully copied extensions.zip, properties, Jasper, and artifacts ear and jar files to appserver node: ${node}"
+                                    }
+                                }
+                            }
+                        def agnt_servers_artifacts_parallelBranches = [:]
+                            agnt_servers.each { node ->
+                                agnt_servers_artifacts_parallelBranches[node] = {
+                                    catchError {
+                                        echo "Copying properties & Jasper folder files to agentserver node: ${node}"
+                                        sh """
+                                            ssh ${ssh_user}@${node} 'mkdir -p /home/${ssh_user}/devOps/{properties,jasperreports,jars}'
+                                            scp -r ${git_clone_dir}/${git_sub_dir}/properties/${properties_env}/*.* ${ssh_user}@${node}://home/${ssh_user}/devOps/properties/
+                                            scp -r ${git_clone_dir}/${git_sub_dir}/jasperreports/jasperreports.zip ${ssh_user}@${node}://home/${ssh_user}/devOps/jasperreports/
+                                            scp -r ${build_artifacts_dir}/*.jar ${ssh_user}@${node}://home/${ssh_user}/devOps/jars/
+                                        """
+                                        echo "Successfully copied properties,Jasper files and artifacts jar files to agentserver node: ${node}"
+                                    }
+                                }
+                            }
+                        parallel app_servers_artifacts_parallelBranches
+                        parallel agnt_servers_artifacts_parallelBranches
+                        // // Copy Artifacts smcfs.ear and EJB.jar to Dmgr
+                        // echo "Copying the smcfs.ear and ejb.jar to Dmgr node: ${dmgr_node}"
+                        // sh """
+                        //     #ssh ${dmgr_user}@${dmgr_node} "sh /home/${dmgr_user}/script/backupLastBuildEar.sh" #Commenting this on DEV and UAT 
+                        //     scp -r ${build_artifacts_dir}/smcfs.ear ${dmgr_user}@${dmgr_node}://home/${dmgr_user}/ear/
+                        //     scp -r ${build_artifacts_dir}/smcfsejb.jar ${dmgr_user}@${dmgr_node}://home/${dmgr_user}/ear/
+                        // """
+                        // echo "Successfully copied the smcfs.ear and ejb.jar to Dmgr node: ${dmgr_node} "
+
+                        echo "Saving the Last Commit Hash for this deployment"
+                        dir("${git_clone_dir}/${git_sub_dir}") {
+                            sh "git log -n 1 --pretty=format:'%H' > ${git_commit_txt}"
+                        }
+                        // Delete the folder ${git_clone_dir}/${git_sub_dir}
+                        echo "Deleting the folder ${git_clone_dir}/${git_sub_dir}"
+                        sh """
+                        rm -fr ${git_clone_dir}/${git_sub_dir}*
+                        """
+                    } catch (Exception e) {
+                        error("Failed to Copy Artifacts and Repo changes to App & Agent Nodes: ${e.message}")
+                    }
+                }
+            }
+        }
+        
+        stage('Call ZDT Deploy Job'){
+            when {
+                expression {params.DEPLOY_APP_NODES == true}
+            }
+            steps {
+                // Run the RIPPLERESTART_WAS_CLUSTER Jenkins Job with parameters
+                build job: 'OMS10_SCM_2_ZDT_EAR_DEPLOY'
+            }
+        }
+        stage('Call Agent SSS Job') {
+            when {
+                expression {params.DEPLOY_AGNT_INTG_NODES == true}
+            }
+            steps {
+                script {
+                    // Run the SSS Jenkins Job with parameters
+                    build job: 'OMS10_SCM_3_AGNT_INTG_STOP_SETUP_START', parameters: [
+                        booleanParam(name: 'STOP_ALL', value: true),
+                        booleanParam(name: 'SETUP_AGENT_BOX', value: true),
+                        booleanParam(name: 'START_ALL', value: true)
+                    ]
+                }
+            }
+        }
+    }
+    post {
+        success {
+            emailext (
+                subject: "OMS Sterling Build Success: ${env.JOB_NAME} - ${env.BUILD_NUMBER}",
+                body: """
+                <html>
+                <body style="font-family: Arial, sans-serif; color: #333;">
+                    <h2 style="color: #006600;">Build Success Notification</h2>
+                    <p>Dear Team,</p>
+                    <p><b>Job Name:</b> ${env.JOB_NAME}</p>
+                    <p><b>Build Number:</b> ${env.BUILD_NUMBER}</p>
+                    <p>The build has succeeded successfully. Here are the details:</p>
+                    <ul style="background-color: #f9f9f9; padding: 10px; border: 1px solid #ddd;">
+                        <li><b>Build URL:</b> <a href="${env.BUILD_URL}">${env.BUILD_URL}</a></li>
+                        <li><b>Duration:</b> ${currentBuild.durationString}</li>
+                    </ul>
+                    <p style="color: #006600;"><b>Great job! The build passed successfully.</b></p>
+                    <br>
+                    <p>Best Regards,</p>
+                    <p>DevOps Team - Jenkins</p>
+                </body>
+                </html>
+                """,
+                mimeType: 'text/html',
+                to: "<email Ids >"
+            )
+        }
+        failure {
+            emailext (
+                subject: "OMS Sterling Build Failed: ${env.JOB_NAME} - ${env.BUILD_NUMBER}",
+                body: """
+                <html>
+                <body style="font-family: Arial, sans-serif; color: #333;">
+                    <h2 style="color: #ff0000;">Build Failure Notification</h2>
+                    <p>Dear Team,</p>
+                    <p><b>Job Name:</b> ${env.JOB_NAME}</p>
+                    <p><b>Build Number:</b> ${env.BUILD_NUMBER}</p>
+                    <p>The build has failed with the following error:</p>
+                    <pre>${currentBuild.getRawBuild().getLog(100).join('\n')}</pre>
+                    <p style="color: #d9534f;"><b>Please review the build log for more details.</b></p>
+                    <br>
+                    <p>Best Regards,</p>
+                    <p>DevOps Team - Jenkins</p>
+                </body>
+                </html>
+                """,
+                mimeType: 'text/html',
+                to: "<email Ids >"
+            )
+        }
+    }
+}
