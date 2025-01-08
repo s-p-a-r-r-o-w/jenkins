@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+Licensed Materials - Property of IBM
+IBM Sterling Selling and Fulfillment Suite
+(C) Copyright IBM Corp. 2001, 2013 All Rights Reserved.
+US Government Users Restricted Rights - Use, duplication or disclosure restricted by GSA ADP Schedule Contract with IBM Corp.
+-->
+<preferences>
+	<configsynch>
+		<Settings CustomEntityClass="" MaxChangesToDisplay="100" ReportsDir="/opt/IBM/OMS10/logs">
+			<AuditDeployment ValidateLockid="N" ValidateOldValues="N" ValidateRecordExistsBeforeDelete="N"/>
+		</Settings>
+		<SourceDatabases>
+			<Database Name="PROD_DB"
+			          className="com.ibm.db2.jcc.DB2Driver" dbType="db2"
+			          folder=""
+			          jdbcURL="jdbc:db2://hostname:dbport/dbname"
+			          schema="OMSINST1" user="omsinst1"/>
+		</SourceDatabases>
+		<TargetDatabases>
+			<Database Name="CONFIG_XML" className=""
+			          dbType="xml"
+			          xml_folder="ChangeMe"
+			          jdbcURL="" schema="" user=""/>
+		</TargetDatabases>
+		<SourceTargetPrefs>
+			<SourceTargetPrefs>
+				<SourceTargetPair SourceDatabase="PROD_DB" TargetDatabase="CONFIG_XML">
+					<Ignore>
+					</Ignore>
+					<AppendOnly>
+					</AppendOnly>
+				</SourceTargetPair>
+			</SourceTargetPrefs>
+		</SourceTargetPrefs>
+	</configsynch>
+</preferences>

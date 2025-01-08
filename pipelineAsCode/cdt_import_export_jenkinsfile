@@ -1,0 +1,142 @@
+/////////////////////////////////////////////////////////////
+// Jenkins pipeline for UAT Sterling CDT Import and Export
+// Label Maintainer: Saravanan V       
+/////////////////////////////////////////////////////////////
+pipeline {
+    agent {
+        label '<agent Label>'
+    }
+    options {
+        disableConcurrentBuilds()
+    }
+    environment {
+        // Replace the values as per the environment
+        sterling_dir = "/opt/IBM/OMS10"
+        node_environment = "UAT"
+        ssh_user = "username"                                       // Specify the SSH username of APP Nodes
+        app_node = "hostname"                                     // Specify the IP of UAT App Node
+    }
+    parameters {
+        booleanParam(name: 'EXPORT', defaultValue: false, description: 'Enable this option to create a backup of the current UAT_CDT_LATEST Sterling configuration (DB to XML).')
+        booleanParam(name: 'IMPORT', defaultValue: false, description: 'Enable this option to restore the configuration from UAT_CDT_LATEST | MC_CDT_LATEST Sterling XML into the UAT environment (XML to DB).')
+        choice(name: 'IMPORT_CDT', choices: ['', 'UAT_OMS_XML to UAT_OMS_DB', 'MC_OMS_XML to UAT_OMS_DB'], description: 'Select the source XML file for the CDT import process: UAT OMS XML | MC OMS XML to UAT OMS Database.')
+        string(name: 'IMPORT_CONFIG_XML_ZIP', defaultValue: '', description: 'Specify the full directory path of the XML configuration zip for the UAT or MC CDT import. EX: /home/omsadmin/CDT/EXPORT/UAT_CDT_LATEST.zip | /home/omsadmin/CDT/IMPORT/MC_CDT_LATEST.zip')
+    }
+
+    stages {
+        stage('Build Detail') {
+            steps { 
+                script {
+                    def outputMessage = """
+CDT Export      : ${params.EXPORT}
+CDT Import      : ${params.IMPORT}
+Import CDT      : ${params.IMPORT_CDT}
+Config XML Zip  : ${params.IMPORT_CONFIG_XML_ZIP}
+"""
+                    echo outputMessage
+                }
+            }
+        }
+        stage('Copy Script Lib to Node') {
+            steps {
+                script {
+                    try {
+                        // Execute the GIT Checkout in custom workspace
+                        // Checkout Git repository into the subdirectory with credentials
+                        def GIT_REPO_URL = ''
+                        def GIT_CREDENTIALS_ID = ''
+                        checkout([$class: 'GitSCM',
+                                branches: [[name: 'CDT_LIB']], doGenerateSubmoduleConfigurations: false,
+                                extensions: [[$class: 'CloneOption', noTags: true, reference: '', shallow: true, depth: 1,
+                                                sparseCheckoutPaths: [[path: 'CDT_LIB']]]],
+                                userRemoteConfigs: [[url: GIT_REPO_URL, credentialsId: GIT_CREDENTIALS_ID]]
+                        ])
+                        echo "Copying CDT Library scripts to ${node_environment} Node"
+                        sh """
+                            scp -r ${WORKSPACE}/${node_environment}/shellscripts/*port.sh ${ssh_user}@${app_node}://opt/IBM/Scripts/
+                            scp -r ${WORKSPACE}/${node_environment}/shellscripts/cdtshell_template.sh ${ssh_user}@${app_node}:/${sterling_dir}/bin/
+                            scp -r ${WORKSPACE}/${node_environment}/ydkresources/ydkprefs*.xml ${ssh_user}@${app_node}:/${sterling_dir}/resources/ydkresources/
+                        """
+                    } catch (Exception e) {
+                        error("Failed to checkout from Git & Copy Script Lib Files: ${e.message}")
+                    }
+                }
+            }
+        }
+        stage('CDT Export') {
+            when {
+                expression {params.EXPORT == true}
+            }
+            steps { 
+                script {
+                    try {
+                        sh """
+                            ssh ${ssh_user}@${app_node} 'sh /opt/IBM/Scripts/cdtExport.sh -SOURCE UAT_DB -SOURCE_PASS <> -TARGET CONFIG_XML -TARGET_PASS ""'
+                        """
+                    } catch (Exception e) {
+                        error("Failed on CDT Export [DB to XML]: ${e.message}")
+                    }
+                }
+            }
+        }
+        stage('CDT Import') {
+            when {
+                expression {
+                    params.IMPORT == true && 
+                    (params.IMPORT_CDT == 'UAT_OMS_XML to UAT_OMS_DB' || params.IMPORT_CDT == 'MC_OMS_XML to UAT_OMS_DB') &&
+                    params.IMPORT_CONFIG_XML_ZIP?.trim()
+                }
+            }
+            steps { 
+                script {
+                    try {
+                        if (params.IMPORT_CDT == 'UAT_OMS_XML to UAT_OMS_DB') {
+                            echo "Starting CDT Import process for ${params.IMPORT_CDT}"
+                            // Unzip the XML configuration zip file on the remote machine
+                            sh """
+                                ssh ${ssh_user}@${app_node} "
+                                    cd /home/omsadmin/CDT/EXPORT/ && rm -fr UAT_CDT_LATEST
+                                    unzip -qo ${params.IMPORT_CONFIG_XML_ZIP} || { echo 'Failed to unzip ${params.IMPORT_CONFIG_XML_ZIP}'; exit 1; }
+                                "
+                            """
+                            // Execute the CDT import script on the remote machine
+                            sh """
+                                ssh ${ssh_user}@${app_node} "
+                                    sh /opt/IBM/Scripts/cdtImport.sh /home/omsadmin/CDT/EXPORT/UAT_CDT_LATEST \\
+                                        -SOURCE CONFIG_XML \\
+                                        -SOURCE_PASS '' \\
+                                        -TARGET <> \\
+                                        -TARGET_PASS <> || { echo 'CDT Import failed'; exit 1; }
+                                "
+                            """
+                            echo "CDT Import process [${params.IMPORT_CDT}] completed successfully."
+                        }
+                        if (params.IMPORT_CDT == 'MC_OMS_XML to UAT_OMS_DB') {
+                            echo "Starting CDT Import process for ${params.IMPORT_CDT}"
+                            // Unzip the XML configuration zip file on the remote machine
+                            sh """
+                                ssh ${ssh_user}@${app_node} "
+                                    cd /home/omsadmin/CDT/IMPORT/ && rm -fr MC_CDT_LATEST
+                                    unzip -qo ${params.IMPORT_CONFIG_XML_ZIP} || { echo 'Failed to unzip ${params.IMPORT_CONFIG_XML_ZIP}'; exit 1; }
+                                "
+                            """
+                            // Execute the CDT import script on the remote machine
+                            sh """
+                                ssh ${ssh_user}@${app_node} "
+                                    sh /opt/IBM/Scripts/cdtImport.sh /home/omsadmin/CDT/IMPORT/MC_CDT_LATEST \\
+                                        -SOURCE CONFIG_XML \\
+                                        -SOURCE_PASS '' \\
+                                        -TARGET UAT_DB \\
+                                        -TARGET_PASS UHvNfReFV || { echo 'CDT Import failed'; exit 1; }
+                                "
+                            """
+                            echo "CDT Import process [${params.IMPORT_CDT}] completed successfully."
+                        }
+                    } catch (Exception e) {
+                        error("Failed on CDT Import [XML to DB]: ${e.message}")
+                    }
+                }
+            }
+        }
+    }
+}
