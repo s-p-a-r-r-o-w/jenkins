@@ -1,0 +1,320 @@
+<?xml version="1.0"?>
+<project name="OMS" basedir="." default="">
+	<taskdef resource="net/sf/antcontrib/antlib.xml"/>
+	<property file="build_oms.properties"/>
+	<!-- Define macro for deleting directory contents -->
+	<macrodef name="clean_dir">
+		<attribute name="folder" description="Delete all files and Directory"/>
+		<sequential>
+			<mkdir dir="@{folder}"/>
+			<condition property="folder.exists">
+				<available file="@{folder}" type="dir"/>
+			</condition>
+			<if>
+				<isset property="folder.exists"/>
+				<then>
+					<echo message="Cleaning directory: @{folder}"/>
+					<delete includeemptydirs="true">
+						<fileset dir="@{folder}" includes="**/*"/>
+					</delete>
+				</then>
+				<else>
+					<echo message="Directory @{folder} does not exist. Nothing to clean."/>
+				</else>
+			</if>
+		</sequential>
+	</macrodef>
+	<!-- Define Classpath -->
+	<target name="set-classpath">
+		<path id="oms.classpath">
+			<fileset dir="${oms.dir}/jar">
+				<include name="**/*.jar"/>
+			</fileset>
+		</path>
+	</target>
+	<!-- Define targets for required tasks -->
+	<target name="cleanEntitiesFolder" description="Clear Entities folder">
+		<clean_dir folder="${oms.dir}/extensions/global/entities"/>
+	</target>
+	<target name="updateExtensions" description="Update extensions folder">
+		<echo message="Updating extensions folder"/>
+		<copy overwrite="yes" preservelastmodified="false" todir="${oms.dir}/extensions">
+			<fileset dir="${code.dir}/extensions" includes="**"/>
+		</copy>
+	</target>
+	<target name="updateProperties" description="Update properties folder">
+		<echo message="Updating properties folder"/>
+		<copy overwrite="yes" preservelastmodified="false" todir="${oms.dir}/properties">
+			<fileset dir="${code.dir}/properties/dev" includes="**"/>
+		</copy>
+	</target>
+	<target name="updateRepository" description="Update repository folder">
+		<echo message="Updating repository folder"/>
+		<copy overwrite="yes" preservelastmodified="false" todir="${oms.dir}/repository/eardata/isccs/extn">
+			<fileset dir="${code.dir}/repository/eardata/isccs/extn" includes="**"/>
+		</copy>
+	</target>
+	<target name="updateResources" description="Update resource folder">
+		<echo message="Updating resource folder"/>
+		<copy overwrite="yes" preservelastmodified="false" todir="${oms.dir}/resources">
+			<fileset dir="${code.dir}/repository/dev" includes="**"/>
+		</copy>
+	</target>
+
+	<!-- @@@@@@@@@ Sterling -> INSTALL3RDPARTY -> GITHUB jar-extensions folder jars @@@@@@@@@ -->
+	<target name="install3rdpartyjars" description="install3rdParty in Runtime">
+		<echo message="Running install3rdParty on custom JARs.."/>
+		<exec dir="${oms.dir}/bin" executable="${oms.dir}/bin/install3rdParty.${SCRIPT_EXT}">
+			<arg value="3rdparty-jars"/>
+			<arg value="1.0"/>
+			<arg value="-j"/>
+			<arg value="${code.dir}/jar-extensions/*.jar"/>
+			<arg value="-targetJVM"/>
+			<arg value="EVERY"/>
+		</exec>
+	</target>
+	<!-- @@@@@@@@@ Sterling Build -> CustomCode.jar & SAP Jars @@@@@@@@@ -->
+	<target name="buildCustomCode" depends="set-classpath" description="Compile OMS custom code.">
+		<!-- Check if Customcode and SAP jars should be built -->
+		<if>
+			<equals arg1="${customcode}" arg2="true"/>
+			<then>
+				<!-- If customcode=true, execute the exec task to build the Customcode and SAP jars -->
+				<echo message="Compiling the custom code..."/>
+				<clean_dir folder="${build.home}/classes"/>
+				<mkdir dir="${build.home}/classes"/>
+				<echo message="Compiling classes"/>
+				<javac classpathref="oms.classpath" srcdir="${code.dir}/custom-code/src" destdir="${build.home}/classes" executable="${JAVA_HOME}/bin/javac" debug="on"/>
+				<tstamp>
+					<format property="dtTimeStamp" pattern="MM/dd/yyyy hh:mm aa"/>
+				</tstamp>
+				<echo message="------------------ Creating CustomCode.jar, Date ${dtTimeStamp} ------------------"/>
+				<echo message="Creating a 3rd party custom code jar..."/>
+				<clean_dir folder="${build.home}/jar-extensions/common"/>
+				<jar destfile="${build.home}/jar-extensions/common/CustomCode.jar" basedir="${build.home}/classes">
+					<manifest>
+						<section name="version-information">
+							<attribute name="Date" value="${dtTimeStamp}"/>
+						</section>
+					</manifest>
+				</jar>
+				<echo message="------------------ Creating SAP jars, Date ${dtTimeStamp} ------------------"/>
+				<if>
+					<equals arg1="${sap.isPostGst}" arg2="true"/>
+					<then>
+						<echo message="Creating SAP jars for Post GST - sap.isPostGst = True"/>
+						<loadfile property="textFile" srcfile="${basedir}/SAP_Files_PostGST.txt"/>
+					</then>
+					<else>
+						<echo message="Creating SAP jars for GST - sap.isPostGst : False"/>
+						<loadfile property="textFile" srcfile="${basedir}/SAP_Files.txt"/>
+					</else>
+				</if>
+				<for list="${textFile}" param="SAPFiles" delimiter="${line.separator}">
+					<sequential>
+						<jar destfile="${build.home}/jar-extensions/SAP/@{SAPFiles}.jar" basedir="${build.home}/classes" filesetmanifest="mergewithoutmain">
+							<manifest>
+								<attribute name="DependencyFinder" value="main"/>
+								<attribute name="Main-Class" value="in/dmart/commerce/SAP/@{SAPFiles}"/>
+								<attribute name="Class-Path" value="${build.home}"/>
+								<section name="version-information">
+									<attribute name="Date" value="${dtTimeStamp}"/>
+								</section>
+							</manifest>
+							<fileset dir="${build.home}/classes/in/dmart/commerce/SAP" includes=".class"/>
+							<zipfileset src="${oms.dir}/jar/log4j/1_2_17/log4j-1.2.17.jar"/>
+							<zipfileset src="${oms.dir}/dbjar/jdbc/DB2/db2jcc4.jar"/>
+							<zipfileset src="${oms.dir}/dbjar/jdbc/DB2/db2jcc_license_cu.jar"/>
+							<zipfileset src="${oms.dir}/jar/commons_net/1_4_1/commons-net-1.4.1.jar"/>
+						</jar>
+					</sequential>
+				</for>
+			</then>
+			<else>
+				<!-- If customcode=false, copy the Customcode and SAP jars from the preserve build folder -->
+				<echo message="@@@@@@@@@@@@@@@@@@@@@@ Skipped CustomCode.jar and SAP Jars Build, taking it from preserved folder : ${preserve.dir}/DEV @@@@@@@@@@@@@@@@@@@@@@"/>
+				<echo message="Copying CustomCode.jar from folder : ${preserve.dir}/DEV/"/>
+				<copy file="${preserve.dir}/DEV/CustomCode.jar" tofile="${build.home}/jar-extensions/common/CustomCode.jar" overwrite="yes" preservelastmodified="false"/>
+				<echo message="Copying SAP jars from folder : ${preserve.dir}/DEV/SAP"/>
+				<copy todir="${build.home}/jar-extensions/SAP" overwrite="yes" preservelastmodified="false">
+					<fileset dir="${preserve.dir}/DEV/SAP">
+						<include name="*.jar"/>
+					</fileset>
+				</copy>
+			</else>
+		</if>
+	</target>
+	<!-- @@@@@@@@@ Sterling -> INSTALL3RDPARTY CustomCode.jar @@@@@@@@@ -->
+	<target name="install3rdpartyCustomCode" description="Running install3rdParty">
+		<echo message="Running install3rdParty on the custom code jar.."/>
+		<exec dir="${oms.dir}/bin" executable="${oms.dir}/bin/install3rdParty.${SCRIPT_EXT}">
+			<arg value="custom-code"/>
+			<arg value="1.0"/>
+			<arg value="-j"/>
+			<arg value="${build.home}/jar-extensions/common/*.jar"/>
+			<arg value="-targetJVM"/>
+			<arg value="EVERY"/>
+		</exec>
+	</target>
+	<!-- @@@@@@@@@ Sterling -> build -> RESOURCES.JAR @@@@@@@@@ -->
+	<target name="buildResourcesJar" description="Build resources jar">
+		<!-- Check if resources should be built -->
+		<if>
+			<equals arg1="${resources}" arg2="true"/>
+			<then>
+				<!-- If resources=true, execute the exec task to build the resource jar -->
+				<echo message="Building Resources jar"/>
+				<exec executable="${oms.dir}/bin/deployer.${SCRIPT_EXT}" failonerror="true">
+					<arg value="-t"/>
+					<arg value="resourcejar"/>
+				</exec>
+			</then>
+			<else>
+				<!-- If resources=false, copy the resource jar from the preserve build folder -->
+				<echo message="@@@@@@@@@@@@@@@@@@@@@@ Skipped resource jar Build, taking it from preserved folder : ${preserve.dir}/DEV @@@@@@@@@@@@@@@@@@@@@@"/>
+				<echo message="Copying resource jar from folder : ${preserve.dir}/DEV/"/>
+				<copy file="${preserve.dir}/DEV/resources.jar" tofile="${oms.dir}/jar/platform/10_0/resources.jar" overwrite="yes" preservelastmodified="false"/>
+			</else>
+		</if>
+	</target>
+	<!-- @@@@@@@@@ Sterling -> build -> ENTITIES.JAR @@@@@@@@@ -->
+	<target name="buildEntitiesJar" description="Build entities jar">
+		<!-- Check if entities should be built -->
+		<if>
+			<equals arg1="${entity}" arg2="true"/>
+			<then>
+				<!-- If entity=true, execute the exec task to build the entities jar -->
+				<echo message="Building Entities jar"/>
+				<exec executable="${oms.dir}/bin/deployer.${SCRIPT_EXT}" failonerror="true">
+					<arg value="-t"/>
+					<arg value="entitydeployer"/>
+				</exec>
+			</then>
+			<else>
+				<!-- If entity=false, copy the entities jar from the preserve build folder -->
+				<echo message="@@@@@@@@@@@@@@@@@@@@@@ Skipped entities jar Build, taking it from preserved folder : ${preserve.dir}/DEV @@@@@@@@@@@@@@@@@@@@@@"/>
+				<echo message="Copying entities jar from folder : ${preserve.dir}/DEV/"/>
+				<copy file="${preserve.dir}/DEV/entities.jar" tofile="${oms.dir}/jar/platform/10_0/entities.jar" overwrite="yes" preservelastmodified="false"/>
+			</else>
+		</if>
+	</target>
+
+	<!-- @@@@@@@@@ Sterling build -> SMCFS.EAR @@@@@@@@@ -->
+	<target name="buildEar" if="${buildear}" description="Building the ear">
+		<echo message="Building EAR file"/>
+		<!-- execute the buildear command -->
+		<exec dir="." executable="${oms.dir}/bin/buildear.${SCRIPT_EXT}">
+			<arg value="-Dappserver=websphere"/>
+			<arg value="-Dsupportmultiwar=true"/>
+			<arg value="-Dwarfiles=smcfs,sbc,wsc,isccs"/>
+			<arg value="-Dearfile=smcfs.ear"/>
+			<arg value="-Dnodocear=true"/>
+			<arg value="-Ddevmode=true"/>
+			<arg value="-Dnowebservice=false"/>
+			<arg value="create-ear"/>
+		</exec>
+	</target>
+	<!-- @@@@@@@@@ Copy the Artifacts Jars to a centralized folder @@@@@@@@@ -->
+	<target name="copyJars" description="Copy CustomCode,SAP,entities and resources jar">
+		<echo>Copying the entities jar file</echo>
+		<copy file="${oms.dir}/jar/platform/10_0/entities.jar" todir="${oms.dir}/external_deployments" overwrite="yes" preservelastmodified="false"/>
+		<echo>Copying the resources jar file</echo>
+		<copy file="${oms.dir}/jar/platform/10_0/resources.jar" todir="${oms.dir}/external_deployments" overwrite="yes" preservelastmodified="false"/>
+		<echo>Copying the custom code jar file</echo>
+		<copy file="${oms.dir}/jar/custom-code/1.0/CustomCode.jar" todir="${oms.dir}/external_deployments" overwrite="yes" preservelastmodified="false"/>
+		<echo>Copying the SAP jar Files</echo>
+		<copy todir="${oms.dir}/external_deployments" overwrite="yes" preservelastmodified="false">
+			<fileset dir="${build.home}/jar-extensions/SAP">
+				<include name="*.jar"/>
+			</fileset>
+		</copy>
+	</target>
+	<!-- @@@@@@@@@ Preserve the Build @@@@@@@@@ -->
+	<target name="preserveBuild" description="Copy CustomCode, SAP, entities, and resources JARs">
+		<echo message="Preserving the Artifacts"/>
+		<!-- Copy CustomCode.jar -->
+		<copy file="${oms.dir}/jar/custom-code/1.0/CustomCode.jar" todir="${preserve.dir}/DEV" overwrite="yes" preservelastmodified="false"/>
+		<!-- Copy resources.jar -->
+		<copy file="${oms.dir}/jar/platform/10_0/resources.jar" todir="${preserve.dir}/DEV" overwrite="yes" preservelastmodified="false"/>
+		<!-- Copy entities.jar -->
+		<copy file="${oms.dir}/jar/platform/10_0/entities.jar" todir="${preserve.dir}/DEV" overwrite="yes" preservelastmodified="false"/>
+		<!-- Copy SAP JARs -->
+		<copy todir="${preserve.dir}/DEV/SAP" overwrite="yes" preservelastmodified="false">
+			<fileset dir="${build.home}/jar-extensions/SAP">
+				<include name="*.jar"/>
+			</fileset>
+		</copy>
+		<!-- Copy smcfs.ear -->
+		<copy file="${oms.dir}/external_deployments/smcfs.ear" todir="${preserve.dir}/DEV" overwrite="yes" preservelastmodified="false"/>
+		<!-- Copy smcfsejb.jar -->
+		<copy file="${oms.dir}/external_deployments/smcfsejb.jar" todir="${preserve.dir}/DEV" overwrite="yes" preservelastmodified="false"/>
+	</target>
+
+	<!-- @@@@@@@@@ Make the buildBox Ready @@@@@@@@@ -->
+	<target name="prepareBuildBox" description="Update Build Box for GitHub Changes">
+		<antcall target="cleanEntitiesFolder"/>
+		<antcall target="updateExtensions"/>
+		<antcall target="updateProperties"/>
+		<antcall target="updateRepository"/>
+		<antcall target="updateResources"/>
+		<antcall target="install3rdpartyjars"/>
+	</target>
+
+	<!-- @@@@@@@@@ Standard Build Process @@@@@@@@@ -->
+	<target name="buildAll" description="Normal Build Process for Standard Deployment" depends="prepareBuildBox">
+		<antcall target="buildCustomCode"/>
+		<antcall target="install3rdpartyCustomCode"/>
+		<antcall target="buildResourcesJar"/>
+		<antcall target="buildEntitiesJar"/>
+		<antcall target="buildEar"/>
+		<antcall target="copyJars"/>
+		<antcall target="preserveBuild"/>
+	</target>
+
+	<!-- @@@@@@@@@ Hot Build Process @@@@@@@@@ -->
+	<target name="hotBuild" description="Hot Build Process for Hot Deployment" depends="prepareBuildBox">
+		<echo message="Deleting files in a Folder : ${oms.dir}/external_deployments"/>
+		<clean_dir folder="${oms.dir}/external_deployments"/>
+		<!-- @@@@@@@@@ Start Process of CustomCode.jar and SAP Jars @@@@@@@@@ -->
+		<antcall target="buildCustomCode"/>
+		<antcall target="install3rdpartyCustomCode"/>
+		<echo>Copying the custom code jar file</echo>
+		<copy file="${oms.dir}/jar/custom-code/1.0/CustomCode.jar" todir="${oms.dir}/external_deployments" overwrite="yes" preservelastmodified="false"/>
+		<echo>Copying the SAP jar Files</echo>
+		<copy todir="${oms.dir}/external_deployments" overwrite="yes" preservelastmodified="false">
+			<fileset dir="${build.home}/jar-extensions/SAP">
+				<include name="*.jar"/>
+			</fileset>
+		</copy>
+		<!-- Preserve CustomCode.jar -->
+		<echo message="Preserving the Artifacts : CustomCode and SAP Jars"/>
+		<copy file="${oms.dir}/jar/custom-code/1.0/CustomCode.jar" todir="${preserve.dir}/DEV" overwrite="yes" preservelastmodified="false"/>
+		<!-- Preserve SAP JARs -->
+		<copy todir="${preserve.dir}/DEV/SAP" overwrite="yes" preservelastmodified="false">
+			<fileset dir="${build.home}/jar-extensions/SAP">
+				<include name="*.jar"/>
+			</fileset>
+		</copy>
+		<!-- @@@@@@@@@ End Process of CustomCode.jar and SAP Jars @@@@@@@@@ -->
+		<!-- @@@@@@@@@ Start of resources.jar build @@@@@@@@@ -->
+		<antcall target="buildResourcesJar"/>
+		<echo>Copying the resources jar file</echo>
+		<copy file="${oms.dir}/jar/platform/10_0/resources.jar" todir="${oms.dir}/external_deployments" overwrite="yes" preservelastmodified="false"/>
+		<!-- Preserve resources.jar -->
+		<echo message="Preserving the Artifacts : resources.jar"/>
+		<copy file="${oms.dir}/jar/platform/10_0/resources.jar" todir="${preserve.dir}/DEV" overwrite="yes" preservelastmodified="false"/>
+		<!-- @@@@@@@@@ End Process of resources.jar build @@@@@@@@@ -->
+		<!-- @@@@@@@@@ Start of entities.jar build @@@@@@@@@ -->
+		<antcall target="buildEntitiesJar"/>
+		<echo>Copying the entities jar file</echo>
+		<copy file="${oms.dir}/jar/platform/10_0/entities.jar" todir="${oms.dir}/external_deployments" overwrite="yes" preservelastmodified="false"/>
+		<!-- Preserve entities.jar -->
+		<echo message="Preserving the Artifacts: entities.jar"/>
+		<copy file="${oms.dir}/jar/platform/10_0/entities.jar" todir="${preserve.dir}/DEV" overwrite="yes" preservelastmodified="false"/>
+		<!-- @@@@@@@@@ End of entities.jar build @@@@@@@@@ -->
+		<!-- Copy smcfs.ear -->
+		<copy file="${preserve.dir}/DEV/smcfs.ear" todir="${oms.dir}/external_deployments" overwrite="yes" preservelastmodified="false"/>
+		<!-- Copy smcfsejb.jar -->
+		<copy file="${preserve.dir}/DEV/smcfsejb.jar" todir="${oms.dir}/external_deployments" overwrite="yes" preservelastmodified="false"/>
+	</target>
+</project>

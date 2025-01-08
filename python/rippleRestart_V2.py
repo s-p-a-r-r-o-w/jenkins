@@ -1,0 +1,1 @@
+AdminClusterManagement.rippleStartSingleCluster("OMS_CLUSTER")
